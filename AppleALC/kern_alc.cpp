@@ -8,9 +8,11 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_devinfo.hpp>
 #include <Headers/plugin_start.hpp>
+#include <Headers/kern_compression.hpp>
 #include <IOKit/IOService.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <mach/vm_map.h>
+#include <libkern/c++/OSUnserialize.h>
 
 #include "kern_alc.hpp"
 #include "kern_resources.hpp"
@@ -37,8 +39,16 @@ void AlcEnabler::init() {
 		static_cast<AlcEnabler *>(user)->updateProperties();
 	}, this);
 
+#ifdef HAVE_ANALOG_AUDIO
 	if (getKernelVersion() < KernelVersion::Mojave)
 		ADDPR(kextList)[KextIdAppleGFXHDA].switchOff();
+	if (getKernelVersion() >= KernelVersion::Lion)
+		ADDPR(kextList)[KextIdAppleHDAPlatformDriver].switchOff();
+#else
+	ADDPR(kextList)[KextIdAppleGFXHDA].switchOff();
+	ADDPR(kextList)[KextIdAppleHDA].switchOff();
+	ADDPR(kextList)[KextIdAppleHDAPlatformDriver].switchOff();
+#endif
 
 	lilu.onKextLoadForce(ADDPR(kextList), ADDPR(kextListSize),
 	[](void *user, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -60,7 +70,9 @@ void AlcEnabler::init() {
 
 void AlcEnabler::deinit() {
 	controllers.deinit();
+#ifdef HAVE_ANALOG_AUDIO
 	codecs.deinit();
+#endif
 }
 
 void AlcEnabler::updateProperties() {
@@ -99,6 +111,7 @@ void AlcEnabler::updateProperties() {
 			}
 		}
 
+#ifdef HAVE_ANALOG_AUDIO
 		// Secondly, update HDEF device and make it support digital audio
 		if (devInfo->audioBuiltinAnalog && validateInjection(devInfo->audioBuiltinAnalog)) {
 			uint32_t ven = 0;
@@ -133,6 +146,7 @@ void AlcEnabler::updateProperties() {
 				hdaGfx = "onboard-1";
 			updateDeviceProperties(devInfo->audioBuiltinAnalog, devInfo, hdaGfx, true);
 		}
+#endif
 
 		// Thirdly, update IGPU device in case we have digital audio
 		if (hasBuiltinDigitalAudio && validateInjection(devInfo->videoBuiltin)) {
@@ -192,6 +206,49 @@ void AlcEnabler::updateProperties() {
 					}
 				}
 			}
+
+			// Check that we allow sending verbs.
+			uint32_t enableHdaVerbs = 0;
+			uint32_t enableAlcDelay = 0;
+			bool checkVerbs = !PE_parse_boot_argn("alcverbs", &enableHdaVerbs, sizeof(enableHdaVerbs));
+			bool checkDelay = !PE_parse_boot_argn("alcdelay", &enableAlcDelay, sizeof(enableAlcDelay));
+
+			if (checkVerbs || checkDelay) {
+				if (devInfo->audioBuiltinAnalog) {
+					if (checkVerbs && devInfo->audioBuiltinAnalog->getProperty("alc-verbs")) {
+						enableHdaVerbs = 1;
+						checkVerbs = false;
+					}
+					if (checkDelay && devInfo->audioBuiltinAnalog->getProperty("alc-delay")) {
+						enableAlcDelay = 1;
+						checkDelay = false;
+					}
+				}
+
+				for (size_t gpu = 0; gpu < devInfo->videoExternal.size(); gpu++) {
+					auto hdaService = devInfo->videoExternal[gpu].audio;
+					if (checkVerbs && hdaService->getProperty("alc-verbs")) {
+						enableHdaVerbs = 1;
+						checkVerbs = false;
+					}
+
+					if (checkDelay && hdaService->getProperty("alc-delay")) {
+						enableAlcDelay = 1;
+						checkDelay = false;
+					}
+				}
+			}
+
+			if (!enableHdaVerbs) {
+				DBGLOG("alc", "no verb support requested, disabling");
+				ADDPR(kextList)[KextIdIOHDAFamily].switchOff();
+			}
+
+			if (enableAlcDelay) {
+				DBGLOG("alc", "has delay support requested, enabling");
+			} else {
+				progressState |= ProcessingState::PatchHDAController;
+			}
 		}
 
 		DeviceInfo::deleter(devInfo);
@@ -210,6 +267,7 @@ void AlcEnabler::updateDeviceProperties(IORegistryEntry *hdaService, DeviceInfo 
 		WIOKit::renameDevice(hdaService, "HDAU");
 	}
 
+#ifdef HAVE_ANALOG_AUDIO
 	if (isAnalog) {
 		// Refresh our own layout-id named alc-layout-id as follows:
 		// alcid=X has highest priority and overrides any other value.
@@ -255,10 +313,18 @@ void AlcEnabler::updateDeviceProperties(IORegistryEntry *hdaService, DeviceInfo 
 			hdaService->setProperty("PinConfigurations", pinBytes, sizeof(pinBytes));
 		}
 	}
+#else
+	assert(isAnalog == false);
+#endif
 
 	// For every client only set layout-id itself.
-	if (info->firmwareVendor != DeviceInfo::FirmwareVendor::Apple || hdaService->getProperty("use-apple-layout-id") != nullptr)
+	if (info->firmwareVendor != DeviceInfo::FirmwareVendor::Apple || hdaService->getProperty("use-apple-layout-id") != nullptr) {
 		hdaService->setProperty("layout-id", &info->reportedLayoutId, sizeof(info->reportedLayoutId));
+#ifdef HAVE_ANALOG_AUDIO
+		layoutIdIsOverridden = true;
+		layoutIdOverride = info->reportedLayoutId;
+#endif
+	}
 
 	// Pass onboard-X if requested.
 	if (hdaGfx)
@@ -272,20 +338,6 @@ void AlcEnabler::updateDeviceProperties(IORegistryEntry *hdaService, DeviceInfo 
 	} else {
 		DBGLOG("alc", "found existing built-in");
 	}
-}
-
-void AlcEnabler::layoutLoadCallback(uint32_t requestTag, kern_return_t result, const void *resourceData, uint32_t resourceDataLength, void *context) {
-	DBGLOG("alc", "layoutLoadCallback %u %d %d %u %d", requestTag, result, resourceData != nullptr, resourceDataLength, context != nullptr);
-	callbackAlc->updateResource(Resource::Layout, result, resourceData, resourceDataLength);
-	DBGLOG("alc", "layoutLoadCallback done %u %d %d %u %d", requestTag, result, resourceData != nullptr, resourceDataLength, context != nullptr);
-	FunctionCast(layoutLoadCallback, callbackAlc->orgLayoutLoadCallback)(requestTag, result, resourceData, resourceDataLength, context);
-}
-
-void AlcEnabler::platformLoadCallback(uint32_t requestTag, kern_return_t result, const void *resourceData, uint32_t resourceDataLength, void *context) {
-	DBGLOG("alc", "platformLoadCallback %u %d %d %u %d", requestTag, result, resourceData != nullptr, resourceDataLength, context != nullptr);
-	callbackAlc->updateResource(Resource::Platform, result, resourceData, resourceDataLength);
-	DBGLOG("alc", "platformLoadCallback done %u %d %d %u %d", requestTag, result, resourceData != nullptr, resourceDataLength, context != nullptr);
-	FunctionCast(platformLoadCallback, callbackAlc->orgPlatformLoadCallback)(requestTag, result, resourceData, resourceDataLength, context);
 }
 
 IOService *AlcEnabler::gfxProbe(IOService *ctrl, IOService *provider, SInt32 *score) {
@@ -350,6 +402,253 @@ uint32_t AlcEnabler::getAudioLayout(IOService *hdaDriver) {
 	return layout;
 }
 
+void AlcEnabler::handleAudioClientEntitlement(task_t task, const char *entitlement, OSObject *&original) {
+	if ((!original || original != kOSBooleanTrue) && !strcmp(entitlement, "com.apple.private.audio.driver-host"))
+		original = kOSBooleanTrue;
+}
+
+void AlcEnabler::eraseRedundantLogs(KernelPatcher &patcher, size_t index) {
+	static const uint8_t logAssertFind[] = { 0x53, 0x6F, 0x75, 0x6E, 0x64, 0x20, 0x61, 0x73 };
+	static const uint8_t nullReplace[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+	KernelPatcher::LookupPatch currentPatch {
+		&ADDPR(kextList)[index], nullptr, nullReplace, sizeof(nullReplace)
+	};
+
+	if (index == KextIdAppleHDAController || index == KextIdAppleHDA) {
+		currentPatch.find = logAssertFind;
+		if (index == KextIdAppleHDAController)
+			currentPatch.count = 3;
+		else
+			currentPatch.count = 2;
+
+		patcher.applyLookupPatch(&currentPatch);
+		patcher.clearError();
+	}
+}
+
+void AlcEnabler::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	size_t kextIndex = 0;
+
+	while (kextIndex < ADDPR(kextListSize)) {
+		if (ADDPR(kextList)[kextIndex].loadIndex == index)
+			break;
+		kextIndex++;
+	}
+	
+	if (kextIndex == ADDPR(kextListSize))
+		return;
+
+#ifdef HAVE_ANALOG_AUDIO
+	if (kextIndex == KextIdAppleGFXHDA) {
+		KernelPatcher::RouteRequest request("__ZN21AppleGFXHDAController5probeEP9IOServicePi", gfxProbe, orgGfxProbe);
+		patcher.routeMultiple(index, &request, 1, address, size);
+		return;
+	}
+
+	if (!(progressState & ProcessingState::ControllersLoaded)) {
+		grabControllers();
+		progressState |= ProcessingState::ControllersLoaded;
+	} else if (!(progressState & ProcessingState::CodecsLoaded) && ADDPR(kextList)[kextIndex].user[0]) {
+		if (grabCodecs())
+			progressState |= ProcessingState::CodecsLoaded;
+		else
+			DBGLOG("alc", "failed to find a suitable codec, we have nothing to do");
+	}
+#else
+	if (!(progressState & ProcessingState::ControllersLoaded)) {
+		grabControllers();
+		progressState |= ProcessingState::ControllersLoaded;
+	}
+#endif
+
+
+	// Continue to patch controllers
+	
+	if (progressState & ProcessingState::ControllersLoaded) {
+		for (size_t i = 0, num = controllers.size(); i < num; i++) {
+			auto info = controllers[i]->info;
+			if (!info) {
+				DBGLOG("alc", "missing ControllerModInfo for %lu controller", i);
+				continue;
+			}
+
+			DBGLOG("alc", "handling %lu controller %X:%X with %lu patches - %s", i, info->vendor, info->device, info->patchNum, info->name);
+			// Choose a free device-id for NVIDIA HDAU to support multigpu setups
+			if (info->vendor == WIOKit::VendorID::NVIDIA) {
+				for (size_t j = 0; j < info->patchNum; j++) {
+					auto &p = info->patches[j].patch;
+					if (p.size == sizeof(uint32_t) && *reinterpret_cast<const uint32_t *>(p.find) == NvidiaSpecialFind) {
+						DBGLOG("alc", "finding %08X repl at %lu curr %lu", *reinterpret_cast<const uint32_t *>(p.replace), i, currentFreeNvidiaDeviceId);
+						while (currentFreeNvidiaDeviceId < MaxNvidiaDeviceIds) {
+							if (!nvidiaDeviceIdUsage[currentFreeNvidiaDeviceId]) {
+								p.find = reinterpret_cast<const uint8_t *>(&nvidiaDeviceIdList[currentFreeNvidiaDeviceId]);
+								DBGLOG("alc", "assigned %08X find %08X repl at %lu curr %lu", *reinterpret_cast<const uint32_t *>(p.find), *reinterpret_cast<const uint32_t *>(p.replace), i, currentFreeNvidiaDeviceId);
+								nvidiaDeviceIdUsage[currentFreeNvidiaDeviceId] = true;
+								currentFreeNvidiaDeviceId++;
+								break;
+							}
+							currentFreeNvidiaDeviceId++;
+						}
+					}
+				}
+			}
+
+			if (controllers[i]->nopatch) {
+				DBGLOG("alc", "skipping %lu controller %X:%X:%X due to no-controller-patch", i, controllers[i]->vendor, controllers[i]->device, controllers[i]->revision);
+				continue;
+			}
+			applyPatches(patcher, index, info->patches, info->patchNum);
+		}
+
+		// Only do this if -alcdbg is not passed
+		if (!ADDPR(debugEnabled))
+			eraseRedundantLogs(patcher, kextIndex);
+	}
+
+#ifdef HAVE_ANALOG_AUDIO
+	if (progressState & ProcessingState::CodecsLoaded) {
+		for (size_t i = 0, num = codecs.size(); i < num; i++) {
+			auto &info = codecs[i]->info;
+			if (!info) {
+				SYSLOG("alc", "missing CodecModInfo for %lu codec", i);
+				continue;
+			}
+			
+			if (info->platformNum > 0 || info->layoutNum > 0) {
+				DBGLOG("alc", "will route resource loading callbacks");
+				progressState |= ProcessingState::CallbacksWantRouting;
+			}
+			
+			applyPatches(patcher, index, info->patches, info->patchNum);
+		}
+	}
+	
+	if ((progressState & ProcessingState::CallbacksWantRouting) && kextIndex == KextIdAppleHDA) {
+		// functions that exist in all versions
+		KernelPatcher::RouteRequest requests[] {
+			KernelPatcher::RouteRequest("__ZN14AppleHDADriver23performPowerStateChangeE24_IOAudioDevicePowerStateS0_Pj", performPowerChange, orgPerformPowerChange),
+			KernelPatcher::RouteRequest("__ZN20AppleHDACodecGeneric38initializePinConfigDefaultFromOverrideEP9IOService", initializePinConfig, orgInitializePinConfig)
+		};
+		patcher.routeMultiple(index, requests, address, size);
+		
+		
+		// layout and platform load callbacks only exist in 10.6.8 and later
+		if (patcher.solveSymbol(index, "__ZN14AppleHDADriver18layoutLoadCallbackEjiPKvjPv")) {
+			KernelPatcher::RouteRequest requestsCallbacks[] {
+				KernelPatcher::RouteRequest("__ZN14AppleHDADriver18layoutLoadCallbackEjiPKvjPv", layoutLoadCallback, orgLayoutLoadCallback),
+				KernelPatcher::RouteRequest("__ZN14AppleHDADriver20platformLoadCallbackEjiPKvjPv", platformLoadCallback, orgPlatformLoadCallback)
+			};
+			patcher.routeMultiple(index, requestsCallbacks, address, size);
+		} else {
+			patcher.clearError();
+		}
+		
+		// 10.6.8 to 10.7.5, and early versions of 10.8 do not use zlib compression for resources
+		isAppleHDAZlib = getKernelVersion() >= KernelVersion::Mavericks || patcher.solveSymbol(index, "__Z24AppleHDA_zlib_uncompressPhPmPKhm") != 0;
+		if (!isAppleHDAZlib)
+			patcher.clearError();
+
+		// patch AppleHDA to remove redundant logs
+		if (!ADDPR(debugEnabled))
+			eraseRedundantLogs(patcher, kextIndex);
+	}
+#endif
+
+	if (!(progressState & ProcessingState::PatchHDAFamily) && kextIndex == KextIdIOHDAFamily) {
+		progressState |= ProcessingState::PatchHDAFamily;
+		KernelPatcher::RouteRequest request("__ZN16IOHDACodecDevice11executeVerbEtttPjb", IOHDACodecDevice_executeVerb, orgIOHDACodecDevice_executeVerb);
+		patcher.routeMultiple(index, &request, 1, address, size);
+	}
+	
+	if (!(progressState & ProcessingState::PatchHDAController) && kextIndex == KextIdAppleHDAController) {
+		progressState |= ProcessingState::PatchHDAController;
+		KernelPatcher::RouteRequest request("__ZN18AppleHDAController5startEP9IOService", AppleHDAController_start, orgAppleHDAController_start);
+		patcher.routeMultiple(index, &request, 1, address, size);
+	}
+	
+#ifdef HAVE_ANALOG_AUDIO
+	// Layout/platform info is in AppleHDAPlatformDriver on versions prior to 10.6.8
+	if (!(progressState & ProcessingState::PatchHDAPlatformDriver) && kextIndex == KextIdAppleHDAPlatformDriver) {
+		progressState |= ProcessingState::PatchHDAPlatformDriver;
+		KernelPatcher::RouteRequest request("__ZN22AppleHDAPlatformDriver5startEP9IOService", AppleHDAPlatformDriver_start, orgAppleHDAPlatformDriver_start);
+		patcher.routeMultiple(index, &request, 1, address, size);
+	}
+#endif
+
+	// Ignore all the errors for other processors
+	patcher.clearError();
+}
+
+void AlcEnabler::grabControllers() {
+	computerModel = BaseDeviceInfo::get().modelType;
+
+	auto devInfo = DeviceInfo::create();
+	if (devInfo) {
+		// Nice, we found some controller, add it
+		uint32_t ven {0}, dev {0}, rev {0}, lid {0};
+		auto sect = devInfo->audioBuiltinAnalog;
+		if (sect &&
+			WIOKit::getOSDataValue(sect, "vendor-id", ven) &&
+			WIOKit::getOSDataValue(sect, "device-id", dev) &&
+			WIOKit::getOSDataValue(sect, "revision-id", rev) &&
+			WIOKit::getOSDataValue(sect, "alc-layout-id", lid)) {
+
+			insertController(ven, dev, rev, ControllerModInfo::PlatformAny, nullptr != sect->getProperty("no-controller-patch"), lid, sect);
+		} else {
+			SYSLOG("alc", "failed to obtain device info for analog controller (%d)", devInfo->audioBuiltinAnalog != nullptr);
+		}
+
+		DeviceInfo::deleter(devInfo);
+	} else {
+		SYSLOG("alc", "failed to obtain device info for analog controller");
+	}
+
+	if (controllers.size() > 0) {
+		DBGLOG("alc", "found %lu audio controllers", controllers.size());
+		validateControllers();
+	}
+}
+
+void AlcEnabler::validateControllers() {
+	for (size_t i = 0, num = controllers.size(); i < num; i++) {
+		DBGLOG("alc", "validating %lu controller %X:%X:%X", i, controllers[i]->vendor, controllers[i]->device, controllers[i]->revision);
+		for (size_t mod = 0; mod < ADDPR(controllerModSize); mod++) {
+			DBGLOG("alc", "comparing to %lu mod %X:%X", mod, ADDPR(controllerMod)[mod].vendor, ADDPR(controllerMod)[mod].device);
+			if (controllers[i]->vendor == ADDPR(controllerMod)[mod].vendor &&
+				controllers[i]->device == ADDPR(controllerMod)[mod].device) {
+
+				// Check revision if present
+				size_t rev {0};
+				while (rev < ADDPR(controllerMod)[mod].revisionNum &&
+					   ADDPR(controllerMod)[mod].revisions[rev] != controllers[i]->revision)
+					rev++;
+
+				// Check AAPL,ig-platform-id if present
+				if (ADDPR(controllerMod)[mod].platform != ControllerModInfo::PlatformAny &&
+					ADDPR(controllerMod)[mod].platform != controllers[i]->platform) {
+					DBGLOG("alc", "not matching platform was found %X vs %X for %s", ADDPR(controllerMod)[mod].platform, controllers[i]->platform, &ADDPR(controllerMod)[mod].name);
+					continue;
+				}
+
+				// Check if computer model is suitable
+				if (!(computerModel & ADDPR(controllerMod)[mod].computerModel)) {
+					DBGLOG("alc", "unsuitable computer model was found %X vs %X for %s", ADDPR(controllerMod)[mod].computerModel, computerModel, &ADDPR(controllerMod)[mod].name);
+					continue;
+				}
+
+				if (rev != ADDPR(controllerMod)[mod].revisionNum ||
+					ADDPR(controllerMod)[mod].revisionNum == 0) {
+					DBGLOG("alc", "found mod for %lu controller - %s", i, &ADDPR(controllerMod)[mod].name);
+					controllers[i]->info= &ADDPR(controllerMod)[mod];
+					break;
+				}
+			}
+		}
+	}
+}
+
+#ifdef HAVE_ANALOG_AUDIO
 IOReturn AlcEnabler::performPowerChange(IOService *hdaDriver, uint32_t from, uint32_t to, unsigned int *timer) {
 	IOReturn ret = FunctionCast(performPowerChange, callbackAlc->orgPerformPowerChange)(hdaDriver, from, to, timer);
 
@@ -503,162 +802,32 @@ IOReturn AlcEnabler::initializePinConfig(IOService *hdaCodec, IOService *configD
 	return FunctionCast(initializePinConfig, callbackAlc->orgInitializePinConfig)(hdaCodec, configDevice);
 }
 
-void AlcEnabler::handleAudioClientEntitlement(task_t task, const char *entitlement, OSObject *&original) {
-	if ((!original || original != kOSBooleanTrue) && !strcmp(entitlement, "com.apple.private.audio.driver-host"))
-		original = kOSBooleanTrue;
+void AlcEnabler::layoutLoadCallback(uint32_t requestTag, kern_return_t result, const void *resourceData, uint32_t resourceDataLength, void *context) {
+	DBGLOG("alc", "layoutLoadCallback %u %d %d %u %d", requestTag, result, resourceData != nullptr, resourceDataLength, context != nullptr);
+	callbackAlc->updateResource(Resource::Layout, result, resourceData, resourceDataLength);
+	DBGLOG("alc", "layoutLoadCallback done %u %d %d %u %d", requestTag, result, resourceData != nullptr, resourceDataLength, context != nullptr);
+	FunctionCast(layoutLoadCallback, callbackAlc->orgLayoutLoadCallback)(requestTag, result, resourceData, resourceDataLength, context);
 }
 
-void AlcEnabler::eraseRedundantLogs(KernelPatcher &patcher, size_t index) {
-	static const uint8_t logAssertFind[] = { 0x53, 0x6F, 0x75, 0x6E, 0x64, 0x20, 0x61, 0x73 };
-	static const uint8_t nullReplace[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-
-	KernelPatcher::LookupPatch currentPatch {
-		&ADDPR(kextList)[index], nullptr, nullReplace, sizeof(nullReplace)
-	};
-
-	if (index == KextIdAppleHDAController || index == KextIdAppleHDA) {
-		currentPatch.find = logAssertFind;
-		if (index == KextIdAppleHDAController)
-			currentPatch.count = 3;
-		else
-			currentPatch.count = 2;
-
-		patcher.applyLookupPatch(&currentPatch);
-		patcher.clearError();
-	}
-}
-
-void AlcEnabler::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-	size_t kextIndex = 0;
-
-	while (kextIndex < ADDPR(kextListSize)) {
-		if (ADDPR(kextList)[kextIndex].loadIndex == index)
-			break;
-		kextIndex++;
-	}
-	
-	if (kextIndex == ADDPR(kextListSize))
-		return;
-
-	if (kextIndex == KextIdAppleGFXHDA) {
-		KernelPatcher::RouteRequest request("__ZN21AppleGFXHDAController5probeEP9IOServicePi", gfxProbe, orgGfxProbe);
-		patcher.routeMultiple(index, &request, 1, address, size);
-		return;
-	}
-	
-	if (!(progressState & ProcessingState::ControllersLoaded)) {
-		grabControllers();
-		progressState |= ProcessingState::ControllersLoaded;
-	} else if (!(progressState & ProcessingState::CodecsLoaded) && ADDPR(kextList)[kextIndex].user[0]) {
-		if (grabCodecs())
-			progressState |= ProcessingState::CodecsLoaded;
-		else
-			DBGLOG("alc", "failed to find a suitable codec, we have nothing to do");
-	}
-			   
-	// Continue to patch controllers
-	
-	if (progressState & ProcessingState::ControllersLoaded) {
-		for (size_t i = 0, num = controllers.size(); i < num; i++) {
-			auto &info = controllers[i]->info;
-			if (!info) {
-				DBGLOG("alc", "missing ControllerModInfo for %lu controller", i);
-				continue;
-			}
-
-			DBGLOG("alc", "handling %lu controller %X:%X with %lu patches", i, info->vendor, info->device, info->patchNum);
-			// Choose a free device-id for NVIDIA HDAU to support multigpu setups
-			if (info->vendor == WIOKit::VendorID::NVIDIA) {
-				for (size_t j = 0; j < info->patchNum; j++) {
-					auto &p = info->patches[j].patch;
-					if (p.size == sizeof(uint32_t) && *reinterpret_cast<const uint32_t *>(p.find) == NvidiaSpecialFind) {
-						DBGLOG("alc", "finding %08X repl at %lu curr %lu", *reinterpret_cast<const uint32_t *>(p.replace), i, currentFreeNvidiaDeviceId);
-						while (currentFreeNvidiaDeviceId < MaxNvidiaDeviceIds) {
-							if (!nvidiaDeviceIdUsage[currentFreeNvidiaDeviceId]) {
-								p.find = reinterpret_cast<const uint8_t *>(&nvidiaDeviceIdList[currentFreeNvidiaDeviceId]);
-								DBGLOG("alc", "assigned %08X find %08X repl at %lu curr %lu", *reinterpret_cast<const uint32_t *>(p.find), *reinterpret_cast<const uint32_t *>(p.replace), i, currentFreeNvidiaDeviceId);
-								nvidiaDeviceIdUsage[currentFreeNvidiaDeviceId] = true;
-								currentFreeNvidiaDeviceId++;
-								break;
-							}
-							currentFreeNvidiaDeviceId++;
-						}
-					}
-				}
-			}
-
-			if (controllers[i]->nopatch) {
-				DBGLOG("alc", "skipping %lu controller %X:%X:%X due to no-controller-patch", i, controllers[i]->vendor, controllers[i]->device, controllers[i]->revision);
-				continue;
-			}
-			applyPatches(patcher, index, info->patches, info->patchNum);
-		}
-
-		// Only do this if -alcdbg is not passed
-		if (!ADDPR(debugEnabled))
-			eraseRedundantLogs(patcher, kextIndex);
-	}
-	
-	if (progressState & ProcessingState::CodecsLoaded) {
-		for (size_t i = 0, num = codecs.size(); i < num; i++) {
-			auto &info = codecs[i]->info;
-			if (!info) {
-				SYSLOG("alc", "missing CodecModInfo for %lu codec", i);
-				continue;
-			}
-			
-			if (info->platformNum > 0 || info->layoutNum > 0) {
-				DBGLOG("alc", "will route resource loading callbacks");
-				progressState |= ProcessingState::CallbacksWantRouting;
-			}
-			
-			applyPatches(patcher, index, info->patches, info->patchNum);
-		}
-	}
-	
-	if ((progressState & ProcessingState::CallbacksWantRouting) && kextIndex == KextIdAppleHDA) {
-		KernelPatcher::RouteRequest requests[] {
-			KernelPatcher::RouteRequest("__ZN14AppleHDADriver18layoutLoadCallbackEjiPKvjPv", layoutLoadCallback, orgLayoutLoadCallback),
-			KernelPatcher::RouteRequest("__ZN14AppleHDADriver20platformLoadCallbackEjiPKvjPv", platformLoadCallback, orgPlatformLoadCallback),
-			KernelPatcher::RouteRequest("__ZN14AppleHDADriver23performPowerStateChangeE24_IOAudioDevicePowerStateS0_Pj", performPowerChange, orgPerformPowerChange),
-			KernelPatcher::RouteRequest("__ZN20AppleHDACodecGeneric38initializePinConfigDefaultFromOverrideEP9IOService", initializePinConfig, orgInitializePinConfig),
-		};
-
-		patcher.routeMultiple(index, requests, address, size);
-
-		// patch AppleHDA to remove redundant logs
-		if (!ADDPR(debugEnabled))
-			eraseRedundantLogs(patcher, kextIndex);
-	}
-	
-	if (!(progressState & ProcessingState::PatchHDAFamily) && kextIndex == KextIdIOHDAFamily) {
-		progressState |= ProcessingState::PatchHDAFamily;
-		KernelPatcher::RouteRequest request("__ZN16IOHDACodecDevice11executeVerbEtttPjb", IOHDACodecDevice_executeVerb, orgIOHDACodecDevice_executeVerb);
-		patcher.routeMultiple(index, &request, 1, address, size);
-	}
-	
-	if (!(progressState & ProcessingState::PatchHDAController) && kextIndex == KextIdAppleHDAController) {
-		progressState |= ProcessingState::PatchHDAController;
-		KernelPatcher::RouteRequest request("__ZN18AppleHDAController5startEP9IOService", AppleHDAController_start, orgAppleHDAController_start);
-		patcher.routeMultiple(index, &request, 1, address, size);
-	}
-	
-	// Ignore all the errors for other processors
-	patcher.clearError();
+void AlcEnabler::platformLoadCallback(uint32_t requestTag, kern_return_t result, const void *resourceData, uint32_t resourceDataLength, void *context) {
+	DBGLOG("alc", "platformLoadCallback %u %d %d %u %d", requestTag, result, resourceData != nullptr, resourceDataLength, context != nullptr);
+	callbackAlc->updateResource(Resource::Platform, result, resourceData, resourceDataLength);
+	DBGLOG("alc", "platformLoadCallback done %u %d %d %u %d", requestTag, result, resourceData != nullptr, resourceDataLength, context != nullptr);
+	FunctionCast(platformLoadCallback, callbackAlc->orgPlatformLoadCallback)(requestTag, result, resourceData, resourceDataLength, context);
 }
 
 void AlcEnabler::updateResource(Resource type, kern_return_t &result, const void * &resourceData, uint32_t &resourceDataLength) {
 	DBGLOG("alc", "resource-request arrived %s", type == Resource::Platform ? "platform" : "layout");
-	
+
 	for (size_t i = 0, s = codecs.size(); i < s; i++) {
 		DBGLOG("alc", "checking codec %X:%X:%X", codecs[i]->vendor, codecs[i]->codec, codecs[i]->revision);
-		
+
 		auto info = codecs[i]->info;
 		if (!info) {
 			SYSLOG("alc", "missing CodecModInfo for %lu codec at resource updating", i);
 			continue;
 		}
-		
+
 		if ((type == Resource::Platform && info->platforms) || (type == Resource::Layout && info->layouts)) {
 			size_t num = type == Resource::Platform ? info->platformNum : info->layoutNum;
 			DBGLOG("alc", "selecting from %lu files", num);
@@ -666,44 +835,28 @@ void AlcEnabler::updateResource(Resource type, kern_return_t &result, const void
 				auto &fi = (type == Resource::Platform ? info->platforms : info->layouts)[f];
 				DBGLOG("alc", "comparing %lu layout %X/%X", f, fi.layout, controllers[codecs[i]->controller]->layout);
 				if (controllers[codecs[i]->controller]->layout == fi.layout && KernelPatcher::compatibleKernel(fi.minKernel, fi.maxKernel)) {
-					DBGLOG("alc", "found %s at %lu index", type == Resource::Platform ? "platform" : "layout", f);
-					resourceData = fi.data;
-					resourceDataLength = fi.dataLength;
+					DBGLOG("alc", "found %s at %lu index, zlib %u", type == Resource::Platform ? "platform" : "layout", f, isAppleHDAZlib);
+					
+					// decompress resource for non-zlib systems
+					if (!isAppleHDAZlib) {
+						uint32_t bufferLength = 0x7A000; // Buffer size that AppleHDA uses.
+						auto buffer = Compression::decompress(Compression::ModeZLIB, &bufferLength, fi.data, fi.dataLength, nullptr);
+						if (!buffer) {
+							break;
+						}
+						
+						resourceData = buffer;
+						resourceDataLength = bufferLength;
+
+					} else {
+						resourceData = fi.data;
+						resourceDataLength = fi.dataLength;
+					}
 					result = kOSReturnSuccess;
 					break;
 				}
 			}
 		}
-	}
-}
-
-void AlcEnabler::grabControllers() {
-	computerModel = BaseDeviceInfo::get().modelType;
-
-	auto devInfo = DeviceInfo::create();
-	if (devInfo) {
-		// Nice, we found some controller, add it
-		uint32_t ven {0}, dev {0}, rev {0}, lid {0};
-		auto sect = devInfo->audioBuiltinAnalog;
-		if (sect &&
-			WIOKit::getOSDataValue(sect, "vendor-id", ven) &&
-			WIOKit::getOSDataValue(sect, "device-id", dev) &&
-			WIOKit::getOSDataValue(sect, "revision-id", rev) &&
-			WIOKit::getOSDataValue(sect, "alc-layout-id", lid)) {
-
-			insertController(ven, dev, rev, ControllerModInfo::PlatformAny, nullptr != sect->getProperty("no-controller-patch"), lid, sect);
-		} else {
-			SYSLOG("alc", "failed to obtain device info for analog controller (%d)", devInfo->audioBuiltinAnalog != nullptr);
-		}
-
-		DeviceInfo::deleter(devInfo);
-	} else {
-		SYSLOG("alc", "failed to obtain device info for analog controller");
-	}
-
-	if (controllers.size() > 0) {
-		DBGLOG("alc", "found %lu audio controllers", controllers.size());
-		validateControllers();
 	}
 }
 
@@ -771,44 +924,6 @@ bool AlcEnabler::grabCodecs() {
 	return validateCodecs();
 }
 
-void AlcEnabler::validateControllers() {
-	for (size_t i = 0, num = controllers.size(); i < num; i++) {
-		DBGLOG("alc", "validating %lu controller %X:%X:%X", i, controllers[i]->vendor, controllers[i]->device, controllers[i]->revision);
-		for (size_t mod = 0; mod < ADDPR(controllerModSize); mod++) {
-			DBGLOG("alc", "comparing to %lu mod %X:%X", mod, ADDPR(controllerMod)[mod].vendor, ADDPR(controllerMod)[mod].device);
-			if (controllers[i]->vendor == ADDPR(controllerMod)[mod].vendor &&
-				controllers[i]->device == ADDPR(controllerMod)[mod].device) {
-				
-				// Check revision if present
-				size_t rev {0};
-				while (rev < ADDPR(controllerMod)[mod].revisionNum &&
-					   ADDPR(controllerMod)[mod].revisions[rev] != controllers[i]->revision)
-					rev++;
-				
-				// Check AAPL,ig-platform-id if present
-				if (ADDPR(controllerMod)[mod].platform != ControllerModInfo::PlatformAny &&
-					ADDPR(controllerMod)[mod].platform != controllers[i]->platform) {
-					DBGLOG("alc", "not matching platform was found %X vs %X", ADDPR(controllerMod)[mod].platform, controllers[i]->platform);
-					continue;
-				}
-				
-				// Check if computer model is suitable
-				if (!(computerModel & ADDPR(controllerMod)[mod].computerModel)) {
-					DBGLOG("alc", "unsuitable computer model was found %X vs %X", ADDPR(controllerMod)[mod].computerModel, computerModel);
-					continue;
-				}
-			
-				if (rev != ADDPR(controllerMod)[mod].revisionNum ||
-					ADDPR(controllerMod)[mod].revisionNum == 0) {
-					DBGLOG("alc", "found mod for %lu controller", i);
-					controllers[i]->info = &ADDPR(controllerMod)[mod];
-					break;
-				}
-			}
-		}
-	}
-}
-
 bool AlcEnabler::validateCodecs() {
 	size_t i = 0;
 	
@@ -860,6 +975,143 @@ bool AlcEnabler::validateCodecs() {
 	return codecs.size() > 0;
 }
 
+bool AlcEnabler::AppleHDAPlatformDriver_start(IOService* service, IOService* provider) {
+	callbackAlc->replaceAppleHDAPlatformDriverResources(service);
+	
+	return FunctionCast(AppleHDAPlatformDriver_start, callbackAlc->orgAppleHDAPlatformDriver_start)(service, provider);
+}
+
+void AlcEnabler::replaceAppleHDAPlatformDriverResources(IOService *service) {
+	DBGLOG("alc", "replacing AppleHDAPlatformDriver resources");
+	
+	auto pathMapsDriverArray = OSArray::withCapacity((uint32_t) codecs.size());
+	if (pathMapsDriverArray == nullptr) {
+		SYSLOG("alc", "failed to create pathmaps dictionary");
+		return;
+	}
+	auto layoutsDriverArray = OSArray::withCapacity((uint32_t) codecs.size());
+	if (layoutsDriverArray == nullptr) {
+		SYSLOG("alc", "failed to create layouts dictionary");
+		pathMapsDriverArray->release();
+		return;
+	}
+
+	for (size_t i = 0, s = codecs.size(); i < s; i++) {
+		DBGLOG("alc", "adding codec %X:%X:%X", codecs[i]->vendor, codecs[i]->codec, codecs[i]->revision);
+
+		auto info = codecs[i]->info;
+		if (!info) {
+			SYSLOG("alc", "missing CodecModInfo for %lu codec at resource updating", i);
+			continue;
+		}
+		
+		size_t num = info->platformNum;
+		DBGLOG("alc", "selecting platform from %lu files", num);
+		for (size_t f = 0; f < num; f++) {
+			auto &fi = info->platforms[f];
+			DBGLOG("alc", "comparing %lu layout %X/%X", f, fi.layout, controllers[codecs[i]->controller]->layout);
+			if (controllers[codecs[i]->controller]->layout == fi.layout && KernelPatcher::compatibleKernel(fi.minKernel, fi.maxKernel)) {
+				DBGLOG("alc", "found platform at %lu index", f);
+				
+				auto dict = unserializeCodecDictionary(fi.data, fi.dataLength);
+				if (!dict) {
+					SYSLOG("alc", "failed to extract layout data");
+					break;
+				}
+
+				auto pathMaps = dict->getObject("PathMaps");
+				if (pathMaps) {
+					auto pathMapsArray = OSDynamicCast(OSArray, pathMaps);
+					if (pathMapsArray) {
+						pathMapsDriverArray->merge(pathMapsArray);
+					} else {
+						SYSLOG("alc", "PathMaps element is not an array");
+					}
+				} else {
+					SYSLOG("alc", "failed to get PathMaps element");
+				}
+				
+				dict->release();
+				break;
+			}
+		}
+		
+		num = info->layoutNum;
+		DBGLOG("alc", "selecting layout from %lu files", num);
+		for (size_t f = 0; f < num; f++) {
+			auto &fi = info->layouts[f];
+			DBGLOG("alc", "comparing %lu layout %X/%X", f, fi.layout, controllers[codecs[i]->controller]->layout);
+			if (controllers[codecs[i]->controller]->layout == fi.layout && KernelPatcher::compatibleKernel(fi.minKernel, fi.maxKernel)) {
+				DBGLOG("alc", "found layout at %lu index", f);
+				
+				auto dict = unserializeCodecDictionary(fi.data, fi.dataLength);
+				if (!dict) {
+					SYSLOG("alc", "failed to extract platform data");
+					break;
+				}
+
+				// Replace layout ID if a different layout ID is being reported to the OS.
+				if (layoutIdIsOverridden) {
+					auto layoutNum = OSNumber::withNumber(layoutIdOverride, 32);
+					if (layoutNum) {
+						dict->setObject("LayoutID", layoutNum);
+						layoutNum->release();
+					} else {
+						SYSLOG("alc", "failed to set LayoutID");
+					}
+				}
+
+				layoutsDriverArray->setObject(dict);
+				dict->release();
+				break;
+			}
+		}
+	}
+	
+	// Replace existing layouts and pathmaps.
+	service->setProperty("Layouts", layoutsDriverArray);
+	service->setProperty("PathMaps", pathMapsDriverArray);
+	
+	layoutsDriverArray->release();
+	pathMapsDriverArray->release();
+}
+
+OSDictionary* AlcEnabler::unserializeCodecDictionary(const uint8_t *data, uint32_t dataLength) {
+	OSString *errorString = nullptr;
+	OSDictionary *parsedDict = nullptr;
+	uint32_t bufferLength = 0x7A000; // Buffer size that AppleHDA uses.
+	
+	auto buffer = Compression::decompress(Compression::ModeZLIB, &bufferLength, data, dataLength, nullptr);
+	if (!buffer) {
+		return nullptr;
+	}
+	
+	if (bufferLength != 0) {
+		auto parsedXML = OSUnserializeXML((char*) buffer, &errorString);
+		if (parsedXML) {
+			parsedDict = OSDynamicCast(OSDictionary, parsedXML);
+			if (!parsedDict) {
+				parsedXML->release();
+			}
+		}
+		
+		if (!parsedDict) {
+			const char *errorCString = "unknown error";
+			if (errorString && errorString->getCStringNoCopy()) {
+				errorCString = errorString->getCStringNoCopy();
+			}
+			
+			SYSLOG("alc", "failed to unserialize XML: %s", errorCString);
+		}
+	} else {
+		SYSLOG("alc", "failed to decompress zlib");
+	}
+	
+	Buffer::deleter(buffer);
+	return parsedDict;
+}
+#endif
+
 bool AlcEnabler::validateInjection(IORegistryEntry *hdaService) {
 	// Check for no-controller-inject. If set, ignore the controller.
 	bool noControllerInject = nullptr != hdaService->getProperty("no-controller-inject");
@@ -875,7 +1127,7 @@ void AlcEnabler::applyPatches(KernelPatcher &patcher, size_t index, const KextPa
 		if (patch.patch.kext->loadIndex == index) {
 			DBGLOG("alc", "checking patch %lu for %lu kext (%s)", p, index, patch.patch.kext->id);
 			if (patcher.compatibleKernel(patch.minKernel, patch.maxKernel)) {
-				DBGLOG("alc", "applying patch %lu  for %lu kext (%s)", p, index, patch.patch.kext->id);
+				DBGLOG("alc", "applying patch %lu for %lu kext (%s)", p, index, patch.patch.kext->id);
 				patcher.applyLookupPatch(&patch.patch);
 				// Do not really care for the errors for now
 				patcher.clearError();
