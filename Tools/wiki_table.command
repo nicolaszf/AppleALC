@@ -6,8 +6,10 @@
 #  
 
 outfile=~/Desktop/SupportedСodecs.md
-printf '#### Currently supported codecs '$(date '+%Y-%m-%d')'\n' > $outfile
-printf '*This table is generated using [wiki_table.command](https://github.com/acidanthera/AppleALC/blob/master/Tools/wiki_table.command).* \n' >> $outfile
+printf '*Thеse tables are generated using [wiki_table.command](https://github.com/acidanthera/AppleALC/blob/master/Tools/wiki_table.command)* \n' > $outfile
+cd "$(dirname "$0")/../Resources/"
+ver=$(grep "MODULE_VERSION =" ../AppleALC.xcodeproj/project.pbxproj | head -1 |  awk '{ print $3 }' | tr -d ";")
+printf '#### Currently supported codecs '$(date '+%Y-%m-%d')' v'${ver}'\n' >> $outfile
 printf '| Vendor | Codec | Revisions and layouts | MinKernel | MaxKernel |\n' >> $outfile
 printf '|--------|-------|-----------------------|-----------|-----------|\n' >> $outfile
 
@@ -90,7 +92,7 @@ d1='ALC891/ALC867/'
 ALC898)
 d1='ALC898/ALC899/'
 ;;
-VT2020)
+VT2020_2021)
 d1='VT2020/VT2021/'
 ;;
 IDT92HD66C3_65)
@@ -109,7 +111,7 @@ esac
 
 
 printf '| '$vendor' ' >> $outfile
-printf '| ['${d1%/}'](https://github.com/acidanthera/AppleALC/tree/master/Resources/'${d%/}')' >> $outfile
+printf '| ['${d1%/}'](https://github.com/acidanthera/AppleALC/tree/master/Resources/'${d%/}'/Info.plist)' >> $outfile
 printf '| '"${rev}"' layout ' >> $outfile
 cd $d
 u=""
@@ -121,8 +123,9 @@ fi
 done
 
 printf '\n\n' >> $outfile
-printf '| Vendor | Patch for not native | Device | MinKernel | MaxKernel |\n' >> $outfile
-printf '|--------|----------------------|--------|-----------|-----------|\n' >> $outfile
+printf '#### Controllers patches\n' >> $outfile
+printf '| Vendor | Patch for not native | Device | Model | MinKernel | MaxKernel |\n' >> $outfile
+printf '|--------|----------------------|--------|-------|-----------|-----------|\n' >> $outfile
 cd "$(dirname "$0")/Resources/"
 f='Controllers.plist'
 let k=0
@@ -131,10 +134,17 @@ do
 vendor=$(/usr/libexec/PlistBuddy -c "Print $k:Vendor"  "${f}")
 name=$(/usr/libexec/PlistBuddy -c "Print $k:Name"  "${f}")
 device=$(/usr/libexec/PlistBuddy -c "Print $k:Device"  "${f}")
+model=$(/usr/libexec/PlistBuddy -c "Print $k:Model"  "${f}")
 if [ ! -z $device ]
 then
 printf '| '"${vendor}"' ' >> $outfile
 printf '| [%s](https://github.com/acidanthera/AppleALC/blob/master/Resources/Controllers.plist) | 0x%04X' "${name}" "${device}" >> $outfile
+
+if [ -z $model ]
+then model=" — "
+fi
+printf '| '"${model}"' ' >> $outfile
+
 
 i=0
 version1=20

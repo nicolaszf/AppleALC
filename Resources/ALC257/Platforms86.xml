@@ -1,7 +1,24 @@
 <dict>
+	<key>CommonPeripheralDSP</key>
+	<array>
+		<dict>
+			<key>DeviceID</key>
+			<integer>0</integer>
+			<key>DeviceType</key>
+			<string>Headphone</string>
+		</dict>
+		<dict>
+			<key>DeviceID</key>
+			<integer>0</integer>
+			<key>DeviceType</key>
+			<string>Microphone</string>
+		</dict>
+	</array>
 	<key>PathMaps</key>
 	<array>
 		<dict>
+			<key>Comment</key>
+			<string>Armenio - Realtek ALC257 Lenovo T480 (0x17aa225d) - from codec dump</string>
 			<key>PathMap</key>
 			<array>
 				<array>
@@ -13,24 +30,24 @@
 									<key>Channels</key>
 									<array>
 										<dict>
-											<key>Channel</key>
-											<integer>1</integer>
 											<key>Bind</key>
+											<integer>1</integer>
+											<key>Channel</key>
 											<integer>1</integer>
 										</dict>
 										<dict>
-											<key>Channel</key>
-											<integer>2</integer>
 											<key>Bind</key>
+											<integer>2</integer>
+											<key>Channel</key>
 											<integer>2</integer>
 										</dict>
 									</array>
 									<key>MuteInputAmp</key>
 									<true/>
 									<key>PublishMute</key>
-									<false/>
+									<true/>
 									<key>PublishVolume</key>
-									<false/>
+									<true/>
 									<key>VolumeInputAmp</key>
 									<true/>
 								</dict>
@@ -40,12 +57,27 @@
 							<dict>
 								<key>Amp</key>
 								<dict>
+									<key>Channels</key>
+									<array>
+										<dict>
+											<key>Bind</key>
+											<integer>1</integer>
+											<key>Channel</key>
+											<integer>1</integer>
+										</dict>
+										<dict>
+											<key>Bind</key>
+											<integer>2</integer>
+											<key>Channel</key>
+											<integer>2</integer>
+										</dict>
+									</array>
 									<key>MuteInputAmp</key>
 									<true/>
 									<key>PublishMute</key>
-									<false/>
+									<true/>
 									<key>PublishVolume</key>
-									<false/>
+									<true/>
 									<key>VolumeInputAmp</key>
 									<true/>
 								</dict>
@@ -53,6 +85,8 @@
 								<integer>35</integer>
 							</dict>
 							<dict>
+								<key>Boost</key>
+								<integer>1</integer>
 								<key>NodeID</key>
 								<integer>18</integer>
 							</dict>
@@ -68,24 +102,24 @@
 									<key>Channels</key>
 									<array>
 										<dict>
-											<key>Channel</key>
-											<integer>1</integer>
 											<key>Bind</key>
+											<integer>1</integer>
+											<key>Channel</key>
 											<integer>1</integer>
 										</dict>
 										<dict>
-											<key>Channel</key>
-											<integer>2</integer>
 											<key>Bind</key>
+											<integer>2</integer>
+											<key>Channel</key>
 											<integer>2</integer>
 										</dict>
 									</array>
 									<key>MuteInputAmp</key>
 									<true/>
 									<key>PublishMute</key>
-									<false/>
+									<true/>
 									<key>PublishVolume</key>
-									<false/>
+									<true/>
 									<key>VolumeInputAmp</key>
 									<true/>
 								</dict>
@@ -95,12 +129,27 @@
 							<dict>
 								<key>Amp</key>
 								<dict>
+									<key>Channels</key>
+									<array>
+										<dict>
+											<key>Bind</key>
+											<integer>1</integer>
+											<key>Channel</key>
+											<integer>1</integer>
+										</dict>
+										<dict>
+											<key>Bind</key>
+											<integer>2</integer>
+											<key>Channel</key>
+											<integer>2</integer>
+										</dict>
+									</array>
 									<key>MuteInputAmp</key>
 									<true/>
 									<key>PublishMute</key>
-									<false/>
+									<true/>
 									<key>PublishVolume</key>
-									<false/>
+									<true/>
 									<key>VolumeInputAmp</key>
 									<true/>
 								</dict>
@@ -140,20 +189,20 @@
 									<key>Channels</key>
 									<array>
 										<dict>
-											<key>Channel</key>
-											<integer>1</integer>
 											<key>Bind</key>
+											<integer>1</integer>
+											<key>Channel</key>
 											<integer>1</integer>
 										</dict>
 										<dict>
-											<key>Channel</key>
-											<integer>2</integer>
 											<key>Bind</key>
+											<integer>2</integer>
+											<key>Channel</key>
 											<integer>2</integer>
 										</dict>
 									</array>
 									<key>MuteInputAmp</key>
-									<false/>
+									<true/>
 									<key>PublishMute</key>
 									<true/>
 									<key>PublishVolume</key>
@@ -189,20 +238,20 @@
 									<key>Channels</key>
 									<array>
 										<dict>
-											<key>Channel</key>
-											<integer>1</integer>
 											<key>Bind</key>
+											<integer>1</integer>
+											<key>Channel</key>
 											<integer>1</integer>
 										</dict>
 										<dict>
-											<key>Channel</key>
-											<integer>2</integer>
 											<key>Bind</key>
+											<integer>2</integer>
+											<key>Channel</key>
 											<integer>2</integer>
 										</dict>
 									</array>
 									<key>MuteInputAmp</key>
-									<false/>
+									<true/>
 									<key>PublishMute</key>
 									<true/>
 									<key>PublishVolume</key>
@@ -219,21 +268,6 @@
 			</array>
 			<key>PathMapID</key>
 			<integer>86</integer>
-		</dict>
-	</array>
-	<key>CommonPeripheralDSP</key>
-	<array>
-		<dict>
-			<key>DeviceID</key>
-			<integer>0</integer>
-			<key>DeviceType</key>
-			<string>Headphone</string>
-		</dict>
-		<dict>
-			<key>DeviceID</key>
-			<integer>0</integer>
-			<key>DeviceType</key>
-			<string>Microphone</string>
 		</dict>
 	</array>
 </dict>
